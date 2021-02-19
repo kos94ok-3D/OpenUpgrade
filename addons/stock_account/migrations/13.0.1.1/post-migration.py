@@ -22,7 +22,7 @@ def generate_stock_valuation_layer(env):
     for move in done_moves:
         diff = move.quantity_done
         if move._is_in() and diff > 0 or move._is_out() and diff < 0:
-            _product_price_update_before_done(move, std_price_update)
+            _product_price_update_before_done(env, move, std_price_update)
             _create_in_svl(env, move, std_price_update)
             if move.product_id.cost_method in ('average', 'fifo'):
                 _run_fifo_vacuum(env, move.product_id, move.company_id, std_price_update)
@@ -34,12 +34,11 @@ def generate_stock_valuation_layer(env):
             _create_dropshipped_svl(env, move, std_price_update)
 
 
-def _product_price_update_before_done(move, std_price_update):
+def _product_price_update_before_done(env, move, std_price_update):
     # adapt standard price on incomming moves if the product cost_method is 'average'
     if move.with_context(force_company=move.company_id.id).product_id.cost_method == 'average':
         product = move.product_id.with_context(force_company=move.company_id.id)
-        product._compute_value_svl()
-        product_tot_qty_available = product.quantity_svl
+        value_svl, product_tot_qty_available = _compute_value_svl(env, product, move.company_id)
         rounding = move.product_id.uom_id.rounding
 
         valued_move_lines = move._get_in_move_lines()
@@ -224,10 +223,10 @@ def _run_fifo_vacuum(env, product, company, std_price_update):
 
         # If some negative stock were fixed, we need to recompute the standard price.
         product = product.with_context(force_company=company.id)
-        product._compute_value_svl()
+        value_svl, quantity_svl = _compute_value_svl(env, product, company)
         if product.cost_method == 'average' \
-                and not float_is_zero(product.quantity_svl, precision_rounding=product.uom_id.rounding):
-            std_price_update[company.id, product.id] = product.value_svl / product.quantity_svl
+                and not float_is_zero(quantity_svl, precision_rounding=product.uom_id.rounding):
+            std_price_update[company.id, product.id] = value_svl / quantity_svl
 
 
 def _change_standard_price(env, move, std_price_update):
@@ -241,8 +240,7 @@ def _change_standard_price(env, move, std_price_update):
         ], order='create_date desc, id desc', limit=1)
         if not last_svl:
             return
-        product._compute_value_svl()
-        quantity_svl = product.quantity_svl
+        value_svl, quantity_svl = _compute_value_svl(env, product, company)
         if not float_is_zero(quantity_svl, precision_rounding=product.uom_id.rounding):
             env.cr.execute("""
             SELECT id, company_id, product_id, datetime, cost, create_uid, write_uid, write_date
@@ -318,6 +316,22 @@ def _get_related_account_move(env, svl_vals):
     if len(account_moves) > 1:
         return env['account.move']
     return account_moves
+
+
+def _compute_value_svl(env, product, company):
+    # We call this function because the product doesn`t have in cache correct value
+    # when we create SVL by SQL
+    # use sql instead of ORM because it saves ~30% time
+    openupgrade.logged_query(env.cr, """
+        SELECT product_id, sum(value) AS value, sum(quantity) AS quantity
+        FROM stock_valuation_layer
+        WHERE product_id = %s AND company_id = %s
+        GROUP BY product_id
+    """, (product.id, company.id))
+    result = env.cr.fetchone()
+    if result:
+        return company.currency_id.round(result[1]), result[2]
+    return 0.0, 0.0
 
 
 @openupgrade.migrate()
